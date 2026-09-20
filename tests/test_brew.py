@@ -116,6 +116,13 @@ class Feed(unittest.TestCase):
         self.assertEqual(enc.get("url"), "https://example.com/tok/episodes/2026-09-19.mp3")
         self.assertEqual(enc.get("length"), "1234")
 
+    def test_stray_whitespace_in_url_and_token_is_stripped(self):
+        xml = brew.build_feed([episode(19)], "  https://example.com/ ", " tok\n")
+        root = ET.fromstring(xml)
+        self.assertEqual(root.find("channel/link").text, "https://example.com/tok/feed.xml")
+        self.assertEqual(root.find("channel/item/enclosure").get("url"),
+                         "https://example.com/tok/episodes/2026-09-19.mp3")
+
     def test_publish_prunes_old_episodes(self):
         with tempfile.TemporaryDirectory() as d:
             storage = brew.LocalStorage(Path(d))

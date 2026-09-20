@@ -373,7 +373,7 @@ def make_storage():
 # ----------------------------------------------------------------- feed ----
 
 def build_feed(episodes: list[Episode], base_url: str, token: str) -> str:
-    root = f"{base_url.rstrip('/')}/{token}"
+    root = f"{base_url.strip().rstrip('/')}/{token.strip()}"
     items = []
     for ep in episodes:
         items.append(f"""\
@@ -467,11 +467,15 @@ def main() -> None:
         return
 
     require_env("FEED_TOKEN", "PUBLIC_BASE_URL")
-    token = os.environ["FEED_TOKEN"]
+    token = os.environ["FEED_TOKEN"].strip()
+    base_url = os.environ["PUBLIC_BASE_URL"].strip()  # pasted secrets often carry stray spaces
     storage = make_storage()
     episodes = load_episodes(storage, token)
     if not args.force and any(e.id == msg_id for e in episodes):
-        print("Already published today's episode.")
+        # Cheap and self-healing: settings like the base URL apply without a new episode.
+        storage.put(f"{token}/feed.xml", build_feed(episodes, base_url, token).encode(),
+                    "application/rss+xml")
+        print("Already published today's episode; feed refreshed.")
         return
     episodes = [e for e in episodes if e.id != msg_id]
 
@@ -490,9 +494,9 @@ def main() -> None:
         summary=script.split("\n\n")[1][:300] if "\n\n" in script else script[:300],
         published=email.utils.format_datetime(when),
     )
-    publish(storage, token, os.environ["PUBLIC_BASE_URL"], episode, audio, episodes)
+    publish(storage, token, base_url, episode, audio, episodes)
     print(f"Published {episode.title} ({len(audio) / 1e6:.1f} MB)")
-    print(f"Feed: {os.environ['PUBLIC_BASE_URL'].rstrip('/')}/{token}/feed.xml")
+    print(f"Feed: {base_url.rstrip('/')}/{token}/feed.xml")
 
 
 if __name__ == "__main__":
