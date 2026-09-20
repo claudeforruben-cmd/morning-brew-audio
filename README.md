@@ -2,14 +2,14 @@
 
 Every morning this pulls the Morning Brew email from Gmail, has an LLM edit it
 into a listenable script (ads, crossword, footer removed; wording kept), turns
-it into an MP3 with OpenAI text-to-speech, and publishes it to a **private
+it into an MP3 with a free neural text-to-speech voice, and publishes it to a **private
 podcast feed**. Subscribe once in Apple Podcasts on your iPhone; each day's
 episode shows up automatically, with lock-screen controls, speed control, and
 offline download.
 
 ```
-Gmail (IMAP) -> script (gpt-4.1) -> MP3 (gpt-4o-mini-tts) -> S3 storage -> feed.xml -> Podcasts app
-                      runs daily on GitHub Actions (~10 min of audio, roughly $0.15-0.25/day)
+Gmail (IMAP) -> script (Gemini, free) -> MP3 (Edge neural voice, free) -> S3 storage -> feed.xml -> Podcasts app
+                      runs daily on GitHub Actions (~9 min of audio, $0)
 ```
 
 ## One-time setup
@@ -50,7 +50,7 @@ Push this folder to a **private** GitHub repo, then add these under
 |---|---|
 | `GMAIL_ADDRESS` | the Gmail address |
 | `GMAIL_APP_PASSWORD` | the app password |
-| `OPENAI_API_KEY` | your OpenAI key |
+| `GEMINI_API_KEY` | free key from <https://aistudio.google.com/apikey> (no card) |
 | `S3_ENDPOINT_URL` | the S3 endpoint from step 2 |
 | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | from step 2 |
 | `S3_BUCKET` | `brew-audio` |
@@ -80,15 +80,19 @@ clock change). The second run does nothing if the first succeeded. Edit the
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m unittest discover -s tests
 
-# Preview the spoken script for any text file (needs OPENAI_API_KEY)
+# Preview the spoken script for any text file (needs GEMINI_API_KEY)
 .venv/bin/python brew.py --from-file email.txt --script-only
 
 # Full run into ./public instead of cloud storage
 FEED_TOKEN=test PUBLIC_BASE_URL=http://localhost:8000 .venv/bin/python brew.py --from-file email.txt
 ```
 
-Optional env vars: `TTS_VOICE` (default `coral`), `SCRIPT_MODEL`, `TTS_MODEL`,
+Optional env vars: `EDGE_VOICE` (default `en-US-AndrewMultilingualNeural`; try
+`en-US-AvaMultilingualNeural`), `EDGE_RATE` (default `+5%`), `SCRIPT_MODEL`,
 `BREW_TZ` (default `America/New_York`).
+
+Paid, higher-quality option: set `SCRIPT_PROVIDER=openai` and/or
+`TTS_PROVIDER=openai` (plus `OPENAI_API_KEY`), roughly $0.15-0.25/day.
 
 ## Notes
 - The feed is marked `itunes:block`, so it is kept out of public podcast
@@ -97,4 +101,7 @@ Optional env vars: `TTS_VOICE` (default `coral`), `SCRIPT_MODEL`, `TTS_MODEL`,
 - The script step edits rather than summarizes, and a guard logs a warning if
   the script contains a number that isn't in the email. LLMs can still slip, so
   treat this as a listening convenience, not a source of record.
+- The free voice uses Microsoft Edge's online text-to-speech through the
+  unofficial `edge-tts` library. It costs nothing but is not an official API and
+  could break; if it does, switch `TTS_PROVIDER` to `openai`.
 - The last 14 episodes are kept; older files are deleted from the bucket.

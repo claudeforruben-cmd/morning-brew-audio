@@ -29,9 +29,16 @@ KEEP_EPISODES = 14
 MAX_TTS_CHARS = 3800  # OpenAI speech endpoint rejects input over 4096 chars
 MAX_EMAIL_CHARS = 60_000
 
-SCRIPT_MODEL = os.environ.get("SCRIPT_MODEL", "gpt-4.1")
+# Free by default: Gemini free tier for the script, Microsoft Edge neural voices
+# for speech. Set SCRIPT_PROVIDER=openai / TTS_PROVIDER=openai for the paid ones.
+SCRIPT_PROVIDER = os.environ.get("SCRIPT_PROVIDER", "gemini")
+TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "edge")
+SCRIPT_MODEL = os.environ.get(
+    "SCRIPT_MODEL", "gemini-2.5-flash" if SCRIPT_PROVIDER == "gemini" else "gpt-4.1")
 TTS_MODEL = os.environ.get("TTS_MODEL", "gpt-4o-mini-tts")
-TTS_VOICE = os.environ.get("TTS_VOICE", "coral")
+TTS_VOICE = os.environ.get("TTS_VOICE", "coral")  # OpenAI voice
+EDGE_VOICE = os.environ.get("EDGE_VOICE", "en-US-AndrewMultilingualNeural")
+EDGE_RATE = os.environ.get("EDGE_RATE", "+5%")
 TTS_STYLE = (
     "Warm, upbeat morning-radio host. Conversational pace suited to someone "
     "walking. Let the dry humor land without overacting."
@@ -161,18 +168,40 @@ def unsupported_numbers(script: str, source: str) -> list[str]:
     return sorted(nums(body) - nums(source))
 
 
-def write_script(newsletter_text: str, when: datetime) -> str:
+def _llm_gemini(system: str, user: str) -> str:
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{SCRIPT_MODEL}:generateContent",
+        data=json.dumps({
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "generationConfig": {"temperature": 0.2},
+        }).encode(),
+        headers={"Content-Type": "application/json",
+                 "x-goog-api-key": os.environ["GEMINI_API_KEY"]},
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        data = json.load(resp)
+    parts = data["candidates"][0]["content"]["parts"]
+    return "".join(p.get("text", "") for p in parts)
+
+
+def _llm_openai(system: str, user: str) -> str:
     from openai import OpenAI
 
     resp = OpenAI().chat.completions.create(
         model=SCRIPT_MODEL,
         temperature=0.2,
-        messages=[
-            {"role": "system", "content": SCRIPT_PROMPT.format(spoken_date=spoken_date(when))},
-            {"role": "user", "content": newsletter_text[:MAX_EMAIL_CHARS]},
-        ],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
     )
-    script = (resp.choices[0].message.content or "").strip()
+    return resp.choices[0].message.content or ""
+
+
+def write_script(newsletter_text: str, when: datetime) -> str:
+    llm = _llm_gemini if SCRIPT_PROVIDER == "gemini" else _llm_openai
+    script = llm(SCRIPT_PROMPT.format(spoken_date=spoken_date(when)),
+                 newsletter_text[:MAX_EMAIL_CHARS]).strip()
     if len(script.split()) < 200:
         raise RuntimeError(f"Script suspiciously short ({len(script.split())} words):\n{script}")
     if bad := unsupported_numbers(script, newsletter_text):
@@ -210,7 +239,26 @@ def chunk_text(text: str, limit: int = MAX_TTS_CHARS) -> list[str]:
     return chunks
 
 
-def synthesize(script: str) -> bytes:
+def synthesize_edge(script: str) -> bytes:
+    import asyncio
+
+    import edge_tts
+
+    async def run() -> bytes:
+        audio = bytearray()
+        stream = edge_tts.Communicate(script, EDGE_VOICE, rate=EDGE_RATE).stream()
+        async for chunk in stream:
+            if chunk["type"] == "audio":
+                audio += chunk["data"]
+        return bytes(audio)
+
+    audio = asyncio.run(run())
+    if len(audio) < 100_000:
+        raise RuntimeError(f"Edge TTS returned only {len(audio)} bytes of audio")
+    return audio
+
+
+def synthesize_openai(script: str) -> bytes:
     from openai import OpenAI
 
     client = OpenAI()
@@ -227,6 +275,10 @@ def synthesize(script: str) -> bytes:
         )
         audio += resp.content  # MP3 frames concatenate cleanly
     return bytes(audio)
+
+
+def synthesize(script: str) -> bytes:
+    return synthesize_edge(script) if TTS_PROVIDER == "edge" else synthesize_openai(script)
 
 
 # -------------------------------------------------------------- storage ----
@@ -383,7 +435,9 @@ def main() -> None:
     if not text:
         sys.exit("Email had no readable body.")
 
-    require_env("OPENAI_API_KEY")
+    require_env(*(["GEMINI_API_KEY"] if SCRIPT_PROVIDER == "gemini" else ["OPENAI_API_KEY"]))
+    if TTS_PROVIDER == "openai":
+        require_env("OPENAI_API_KEY")
     if args.script_only:
         print(write_script(text, when))
         return
