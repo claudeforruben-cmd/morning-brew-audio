@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +49,50 @@ class Fidelity(unittest.TestCase):
         source = "Stock fell 4.67% to $71.79 and Buffett is 96. Revenue: 5,500,000%."
         script = "Good morning. 19th.\n\nStock fell 4.67 percent to $71.79. Buffett is 96. Revenue 5,500,000 percent. Sales hit 42."
         self.assertEqual(brew.unsupported_numbers(script, source), ["42"])
+
+
+class GeminiFallback(unittest.TestCase):
+    def http_error(self, code):
+        import io
+        import urllib.error
+        return urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(b'{"error":"boom"}'))
+
+    def test_skips_missing_and_out_of_quota_models_then_succeeds(self):
+        calls = []
+
+        def fake(model, system, user):
+            calls.append(model)
+            if len(calls) == 1:
+                raise self.http_error(404)
+            if len(calls) == 2:
+                raise self.http_error(429)
+            return "the script"
+
+        with mock.patch.object(brew, "_gemini_call", fake), \
+                mock.patch.object(brew, "SCRIPT_MODEL", ""):
+            self.assertEqual(brew._llm_gemini("s", "u"), "the script")
+        self.assertEqual(calls, brew.GEMINI_MODELS[:3])
+
+    def test_bad_key_fails_immediately_without_trying_other_models(self):
+        import urllib.error
+        calls = []
+
+        def fake(model, system, user):
+            calls.append(model)
+            raise self.http_error(403)
+
+        with mock.patch.object(brew, "_gemini_call", fake), \
+                mock.patch.object(brew, "SCRIPT_MODEL", ""):
+            with self.assertRaises(urllib.error.HTTPError):
+                brew._llm_gemini("s", "u")
+        self.assertEqual(len(calls), 1)
+
+    def test_all_models_failing_raises_readable_error(self):
+        with mock.patch.object(brew, "_gemini_call",
+                               lambda *a: (_ for _ in ()).throw(self.http_error(404))), \
+                mock.patch.object(brew, "SCRIPT_MODEL", ""):
+            with self.assertRaisesRegex(RuntimeError, "No Gemini model produced a script"):
+                brew._llm_gemini("s", "u")
 
 
 class HtmlToText(unittest.TestCase):

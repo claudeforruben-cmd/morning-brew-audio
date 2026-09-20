@@ -33,8 +33,12 @@ MAX_EMAIL_CHARS = 60_000
 # for speech. Set SCRIPT_PROVIDER=openai / TTS_PROVIDER=openai for the paid ones.
 SCRIPT_PROVIDER = os.environ.get("SCRIPT_PROVIDER", "gemini")
 TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "edge")
-SCRIPT_MODEL = os.environ.get(
-    "SCRIPT_MODEL", "gemini-2.5-flash" if SCRIPT_PROVIDER == "gemini" else "gpt-4.1")
+SCRIPT_MODEL = os.environ.get("SCRIPT_MODEL", "")  # empty = provider default
+# Gemini model names get retired and free-tier quota differs per model, so try
+# these in order until one answers. "gemini-flash-latest" is Google's alias.
+GEMINI_MODELS = ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.7-flash",
+                 "gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+GEMINI_SKIP_STATUSES = {404, 429, 500, 503}  # model missing, no quota, or overloaded
 TTS_MODEL = os.environ.get("TTS_MODEL", "gpt-4o-mini-tts")
 TTS_VOICE = os.environ.get("TTS_VOICE", "coral")  # OpenAI voice
 EDGE_VOICE = os.environ.get("EDGE_VOICE", "en-US-AndrewMultilingualNeural")
@@ -168,11 +172,11 @@ def unsupported_numbers(script: str, source: str) -> list[str]:
     return sorted(nums(body) - nums(source))
 
 
-def _llm_gemini(system: str, user: str) -> str:
+def _gemini_call(model: str, system: str, user: str) -> str:
     import urllib.request
 
     req = urllib.request.Request(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{SCRIPT_MODEL}:generateContent",
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         data=json.dumps({
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}],
@@ -187,11 +191,32 @@ def _llm_gemini(system: str, user: str) -> str:
     return "".join(p.get("text", "") for p in parts)
 
 
+def _llm_gemini(system: str, user: str) -> str:
+    import urllib.error
+
+    failures = []
+    for model in [SCRIPT_MODEL] if SCRIPT_MODEL else GEMINI_MODELS:
+        try:
+            text = _gemini_call(model, system, user)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")[:400]
+            print(f"  gemini {model}: HTTP {e.code} {body}", file=sys.stderr)
+            failures.append(f"{model}: HTTP {e.code}")
+            if e.code not in GEMINI_SKIP_STATUSES:
+                raise  # bad key, bad request, etc.: another model won't help
+            continue
+        if text.strip():
+            print(f"  script written by {model}", file=sys.stderr)
+            return text
+        failures.append(f"{model}: empty response")
+    raise RuntimeError("No Gemini model produced a script: " + "; ".join(failures))
+
+
 def _llm_openai(system: str, user: str) -> str:
     from openai import OpenAI
 
     resp = OpenAI().chat.completions.create(
-        model=SCRIPT_MODEL,
+        model=SCRIPT_MODEL or "gpt-4.1",
         temperature=0.2,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
     )
