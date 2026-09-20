@@ -1,0 +1,38 @@
+name: Daily Morning Brew audio
+
+on:
+  schedule:
+    # Morning Brew lands ~09:20 UTC. Run at 10:15 and again at 11:15 as a
+    # retry; the second run is a no-op if the first succeeded.
+    - cron: "15 10 * * *"
+    - cron: "15 11 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Regenerate even if today's episode exists"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python brew.py ${{ inputs.force && '--force' || '' }}
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
+          S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_REGION: ${{ secrets.S3_REGION }}
+          PUBLIC_BASE_URL: ${{ secrets.PUBLIC_BASE_URL }}
+          FEED_TOKEN: ${{ secrets.FEED_TOKEN }}
