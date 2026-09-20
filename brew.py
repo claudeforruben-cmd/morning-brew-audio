@@ -317,14 +317,13 @@ class S3Storage:
         )
 
     def get(self, key: str) -> bytes | None:
-        from botocore.exceptions import ClientError
-
-        try:
-            return self.s3.get_object(Bucket=self.bucket, Key=key)["Body"].read()
-        except ClientError as e:
-            if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
-                return None
-            raise
+        # List first: some S3-compatible stores (Supabase) answer a GET for a
+        # missing key with a JSON error botocore can't parse, so it surfaces as
+        # a ClientError with a blank code. A listing never has that ambiguity.
+        listing = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=key, MaxKeys=1)
+        if not any(o["Key"] == key for o in listing.get("Contents", [])):
+            return None
+        return self.s3.get_object(Bucket=self.bucket, Key=key)["Body"].read()
 
     def put(self, key: str, data: bytes, content_type: str) -> None:
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=data, ContentType=content_type)
