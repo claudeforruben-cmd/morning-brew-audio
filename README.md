@@ -1,11 +1,22 @@
-# Morning Brew, Read Aloud
+# Newsletter Podcasts (Morning Brew, MarketWatch, WSJ)
 
-Every morning this pulls the Morning Brew email from Gmail, has an LLM edit it
-into a listenable script (ads, crossword, footer removed; wording kept), turns
-it into an MP3 with a free neural text-to-speech voice, and publishes it to a **private
-podcast feed**. Subscribe once in Apple Podcasts on your iPhone; each day's
-episode shows up automatically, with lock-screen controls, speed control, and
-offline download.
+Whenever a newsletter email lands in Gmail, this has an LLM edit it into a
+listenable script (ads, footer, tables removed; wording kept), turns it into an
+MP3 with a free neural text-to-speech voice, and publishes it to a **private
+podcast feed**. There is one feed per newsletter. Subscribe once in Apple
+Podcasts on your iPhone; each episode shows up automatically, with lock-screen
+controls, speed control, and offline download.
+
+| Newsletter | `--source` | Feed URL |
+|---|---|---|
+| Morning Brew | `brew` | `<PUBLIC_BASE_URL>/<FEED_TOKEN>/feed.xml` |
+| MarketWatch | `marketwatch` | `<PUBLIC_BASE_URL>/<FEED_TOKEN>/marketwatch/feed.xml` |
+| Wall Street Journal | `wsj` | `<PUBLIC_BASE_URL>/<FEED_TOKEN>/wsj/feed.xml` |
+
+Subscribe the bot's Gmail directly to each newsletter (forwarding from another
+inbox adds hours of lag). Welcome and confirmation emails are skipped. To add a
+newsletter, add a `Source(...)` in `brew.py` and its name to the workflow's
+`source` options.
 
 ```
 Gmail (IMAP) -> script (Gemini, free) -> MP3 (Edge neural voice, free) -> S3 storage -> feed.xml -> Podcasts app
@@ -58,9 +69,9 @@ Push this folder to a **private** GitHub repo, then add these under
 | `PUBLIC_BASE_URL` | the public base URL from step 2 |
 | `FEED_TOKEN` | from step 3 |
 
-Run **Actions -> Daily Morning Brew audio -> Run workflow** once to publish the
-first episode. The log ends with your feed URL:
-`<PUBLIC_BASE_URL>/<FEED_TOKEN>/feed.xml`
+Run **Actions -> Newsletter podcasts -> Run workflow** once to publish the
+first episodes. Feed URLs are the table at the top (GitHub masks the secret
+parts in logs).
 
 ### 5. iPhone
 In Apple Podcasts: **Search** tab, paste the feed URL into the search box, and
@@ -70,10 +81,15 @@ Latest** so it is ready offline before you leave. Overcast and Pocket Casts
 also accept feed URLs.
 
 ## Schedule
-The workflow runs at 10:15 and 11:15 UTC. The email arrives around 09:20 UTC in
-summer; the second run is the retry for when it arrives later (e.g. after the
-clock change). The second run does nothing if the first succeeded. Edit the
-`cron` lines in `.github/workflows/daily.yml` to change the time.
+The workflow runs every 30 minutes from 09:17 to 14:47 UTC (Morning Brew,
+MarketWatch) and from 20:17 to 23:47 UTC (WSJ Markets P.M., sent after the
+close). Each run publishes any email from the last 2 days that has no episode
+yet, so a late or forwarded email is caught by the next run, and a run with
+nothing new finishes in seconds. It logs the newest email it saw for each
+source. A source that errors turns the run red without blocking the others.
+Edit the `cron` lines in `.github/workflows/daily.yml` to change the windows.
+GitHub pauses scheduled workflows after 60 days without repository activity;
+if episodes stop, re-enable the workflow under the Actions tab.
 
 ## Local use
 ```
@@ -81,7 +97,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m unittest discover -s tests
 
 # Preview the spoken script for any text file (needs GEMINI_API_KEY)
-.venv/bin/python brew.py --from-file email.txt --script-only
+.venv/bin/python brew.py --source wsj --from-file email.txt --script-only
 
 # Full run into ./public instead of cloud storage
 FEED_TOKEN=test PUBLIC_BASE_URL=http://localhost:8000 .venv/bin/python brew.py --from-file email.txt
@@ -104,4 +120,4 @@ Paid, higher-quality option: set `SCRIPT_PROVIDER=openai` and/or
 - The free voice uses Microsoft Edge's online text-to-speech through the
   unofficial `edge-tts` library. It costs nothing but is not an official API and
   could break; if it does, switch `TTS_PROVIDER` to `openai`.
-- The last 14 episodes are kept; older files are deleted from the bucket.
+- The last 14 episodes per feed are kept; older files are deleted from the bucket.

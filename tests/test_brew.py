@@ -1,3 +1,4 @@
+import email.message
 import sys
 import tempfile
 import unittest
@@ -5,6 +6,7 @@ from unittest import mock
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import brew  # noqa: E402
@@ -135,6 +137,131 @@ class Feed(unittest.TestCase):
             self.assertEqual(episodes[0].date, f"2026-09-{brew.KEEP_EPISODES + 2:02d}")
             self.assertFalse((Path(d) / "tok/episodes/2026-09-01.mp3").exists())
             self.assertTrue((Path(d) / "tok/feed.xml").exists())
+
+
+    def test_feed_uses_show_name_and_prefix(self):
+        xml = brew.build_feed([episode(19)], "https://x", "tok/wsj", "WSJ Show", "The WSJ")
+        root = ET.fromstring(xml)
+        self.assertEqual(root.find("channel/title").text, "WSJ Show")
+        self.assertEqual(root.find("channel/link").text, "https://x/tok/wsj/feed.xml")
+        self.assertEqual(root.find("channel/item/enclosure").get("url"),
+                         "https://x/tok/wsj/episodes/2026-09-19.mp3")
+
+
+class Sources(unittest.TestCase):
+    def test_morning_brew_keeps_its_original_feed_location(self):
+        self.assertEqual(brew.SOURCES["brew"].subdir, "")
+
+    def test_each_source_has_its_own_feed_folder(self):
+        subdirs = [s.subdir for s in brew.SOURCES.values()]
+        self.assertEqual(len(set(subdirs)), len(subdirs))
+
+    def test_prompts_format_without_stray_braces(self):
+        for src in brew.SOURCES.values():
+            out = src.prompt.format(spoken_date="Sunday, September 20th",
+                                    publication=src.publication)
+            self.assertIn("Sunday, September 20th", out)
+            self.assertNotIn("{", out)
+
+
+class FakeBox:
+    """Stands in for Mailbox: `mails` is a list of (subject, iso date, message-id)."""
+
+    def __init__(self, mails, body="Some newsletter text. " * 20):
+        self.mails = mails
+        self.body = body
+
+    def search(self, senders, days=2):
+        return [str(i).encode() for i in range(len(self.mails))]
+
+    def headers(self, num):
+        subject, date, mid = self.mails[int(num)]
+        msg = email.message.EmailMessage()
+        msg["Subject"] = subject
+        msg["Date"] = date
+        msg["Message-ID"] = mid
+        return msg
+
+    def message(self, num):
+        msg = self.headers(num)
+        msg.set_content(self.body)
+        return msg
+
+
+TZ = ZoneInfo("America/New_York")
+FRI = ("Fri: Leaving LA", "Fri, 18 Sep 2026 09:20:09 +0000", "<fri@x>")
+SAT = ("Sat: Buffett goodbye", "Sat, 19 Sep 2026 09:20:05 +0000", "<sat@x>")
+WELCOME = ("Welcome to Markets P.M.", "Sun, 20 Sep 2026 12:42:58 +0000", "<w@x>")
+
+
+class RunSource(unittest.TestCase):
+    def run_it(self, src_key, mails, storage, force=False):
+        with mock.patch.object(brew, "write_script", lambda *a: "Hi.\n\nScript body."), \
+                mock.patch.object(brew, "synthesize", lambda script: b"mp3"):
+            return brew.run_source(brew.SOURCES[src_key], FakeBox(mails), storage,
+                                   "tok", "https://x", TZ, force)
+
+    def test_new_feed_starts_with_only_the_latest_email(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = brew.LocalStorage(Path(d))
+            self.assertEqual(self.run_it("brew", [FRI, SAT], storage), 1)
+            titles = [e.title for e in brew.load_episodes(storage, "tok")]
+            self.assertEqual(titles, ["Sep 19: Sat: Buffett goodbye"])
+
+    def test_late_email_is_caught_up_even_after_a_newer_one_published(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = brew.LocalStorage(Path(d))
+            self.run_it("brew", [SAT], storage)
+            self.assertEqual(self.run_it("brew", [FRI, SAT], storage), 1)
+            self.assertEqual(len(brew.load_episodes(storage, "tok")), 2)
+
+    def test_rerun_with_nothing_new_publishes_nothing_but_keeps_feed(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = brew.LocalStorage(Path(d))
+            self.run_it("brew", [SAT], storage)
+            self.assertEqual(self.run_it("brew", [SAT], storage), 0)
+            self.assertTrue((Path(d) / "tok/feed.xml").exists())
+
+    def test_same_email_arriving_with_a_new_message_id_is_not_republished(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = brew.LocalStorage(Path(d))
+            self.run_it("brew", [SAT], storage)
+            direct_copy = (SAT[0], SAT[1], "<different-id@x>")
+            self.assertEqual(self.run_it("brew", [direct_copy], storage), 0)
+
+    def test_welcome_email_never_becomes_an_episode(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = brew.LocalStorage(Path(d))
+            self.assertEqual(self.run_it("wsj", [WELCOME], storage), 0)
+            self.assertEqual(brew.load_episodes(storage, "tok/wsj"), [])
+
+    def test_sources_publish_to_separate_feeds(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = brew.LocalStorage(Path(d))
+            self.run_it("brew", [SAT], storage)
+            self.run_it("wsj", [WELCOME, ("Markets P.M.: Stocks slide",
+                                          "Mon, 21 Sep 2026 21:00:00 +0000", "<m@x>")], storage)
+            self.assertTrue((Path(d) / "tok/feed.xml").exists())
+            self.assertTrue((Path(d) / "tok/wsj/feed.xml").exists())
+            self.assertEqual(len(brew.load_episodes(storage, "tok")), 1)
+            self.assertEqual(len(brew.load_episodes(storage, "tok/wsj")), 1)
+
+    def test_two_editions_on_the_same_day_get_distinct_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = brew.LocalStorage(Path(d))
+            am = ("Markets A.M.: Futures", "Mon, 21 Sep 2026 12:00:00 +0000", "<am@x>")
+            pm = ("Markets P.M.: Close", "Mon, 21 Sep 2026 21:00:00 +0000", "<pm@x>")
+            self.run_it("wsj", [am], storage)
+            self.run_it("wsj", [am, pm], storage)
+            files = {e.file for e in brew.load_episodes(storage, "tok/wsj")}
+            self.assertEqual(len(files), 2)
+
+    def test_force_regenerates_the_newest_email(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = brew.LocalStorage(Path(d))
+            self.run_it("brew", [SAT], storage)
+            self.assertEqual(self.run_it("brew", [SAT], storage, force=True), 1)
+            self.assertEqual(len(brew.load_episodes(storage, "tok")), 1)
 
 
 if __name__ == "__main__":

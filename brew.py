@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Turn today's Morning Brew email into a podcast episode.
+"""Turn newsletter emails (Morning Brew, MarketWatch, WSJ) into podcast episodes.
 
 Pipeline: Gmail (IMAP) -> plain text -> spoken script (LLM) -> MP3 (TTS)
--> object storage -> private podcast RSS feed.
+-> object storage -> one private podcast RSS feed per newsletter.
 
-Idempotent: running it twice on the same day does nothing the second time.
+Idempotent: an email that already has an episode is never processed twice, and
+an email that arrives late is picked up on the next run.
 """
 from __future__ import annotations
 
@@ -24,8 +25,9 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo
 
-SENDER = "crew@morningbrew.com"
 KEEP_EPISODES = 14
+LOOKBACK_DAYS = 2  # how far back to look for emails that have no episode yet
+MAX_NEW_PER_RUN = 3  # newest N unpublished emails per source per run
 MAX_TTS_CHARS = 3800  # OpenAI speech endpoint rejects input over 4096 chars
 MAX_EMAIL_CHARS = 60_000
 
@@ -48,7 +50,7 @@ TTS_STYLE = (
     "walking. Let the dry humor land without overacting."
 )
 
-SCRIPT_PROMPT = """\
+BREW_PROMPT = """\
 You are an EDITOR, not a writer. You turn the Morning Brew newsletter into a \
 script to be read aloud to someone on a morning walk. Output ONLY the words \
 to be spoken.
@@ -93,6 +95,69 @@ Write for the ear:
 End with: "That's your Morning Brew. Have a great walk."
 """
 
+MARKETS_PROMPT = """\
+You are an EDITOR, not a writer. You turn the {publication} email newsletter \
+into a script to be read aloud to someone listening on the go. Output ONLY the \
+words to be spoken.
+
+Fidelity rules (most important):
+- Keep the newsletter's own sentences and wording. Make the smallest edits \
+needed to sound natural when spoken. Do NOT summarize or paraphrase stories.
+- Names, titles, tickers, and terms must appear EXACTLY as written, even if \
+they differ from what you remember. The newsletter is more current than your \
+knowledge. Do not add "former", change a title, or swap a name.
+- Never add facts, opinions, or context that are not in the newsletter.
+
+Start with: "It's {spoken_date}. This is your {publication} briefing." Then go \
+through the newsletter in order.
+
+Keep everything editorial: every story, summary, analysis, and market-moves \
+paragraph, in full. Turn bullet lists into spoken sentences.
+
+Cut entirely: anything sponsored or advertising ("Presented by", "Sponsored", \
+"Advertisement", "Partner content"), promotions and subscription or app offers, \
+"sign up" and "share this" prompts, plugs for other newsletters, polls, \
+quizzes, puzzles, links, photo and image credits and captions, navigation, \
+social links, footer, legal, and unsubscribe text.
+
+Bylines: writers' names and credits are not spoken. Delete them, unless the \
+person is quoted or is the subject of a story.
+
+Tables and tickers: do not read data tables or lists of quotes. Speak only the \
+newsletter's own sentences about the markets.
+
+Write for the ear:
+- No headings, markdown, bullets, or emoji. Section labels may become a brief \
+spoken lead-in ("In the markets,") so the listener knows the topic changed.
+- Keep numbers as digits ("$1.2 million", "1999"); write "%" as "percent" and \
+"bps" as "basis points". Write "US" as "U.S."
+
+End with: "That's your {publication} briefing."
+"""
+
+
+@dataclass(frozen=True)
+class Source:
+    key: str  # --source name, GitHub Actions input
+    show: str  # podcast title
+    publication: str  # spoken name
+    senders: tuple[str, ...]  # Gmail from: matches (address or domain)
+    prompt: str
+    subdir: str = ""  # feed folder under the token; "" keeps the original URL
+    min_words: int = 120  # a script shorter than this means something went wrong
+    # Welcome and confirmation emails are not editions.
+    skip_subject: str = r"\b(welcome|confirm|verify|thanks for signing)\b"
+
+
+SOURCES = {s.key: s for s in (
+    Source("brew", "Morning Brew, Read Aloud", "Morning Brew",
+           ("crew@morningbrew.com",), BREW_PROMPT, min_words=200),
+    Source("marketwatch", "MarketWatch, Read Aloud", "MarketWatch",
+           ("marketwatch.com",), MARKETS_PROMPT, subdir="marketwatch"),
+    Source("wsj", "Wall Street Journal, Read Aloud", "The Wall Street Journal",
+           ("wsj.com",), MARKETS_PROMPT, subdir="wsj"),
+)}
+
 
 @dataclass
 class Episode:
@@ -126,27 +191,37 @@ def message_body(msg: email.message.EmailMessage) -> str:
     return plain.get_content().strip() if plain is not None else ""
 
 
-def fetch_latest_brew(address: str, app_password: str) -> email.message.EmailMessage | None:
-    """Newest email from the Morning Brew daily sender in the last 2 days."""
-    imap = imaplib.IMAP4_SSL("imap.gmail.com")
-    try:
-        imap.login(address, app_password)
-        imap.select('"[Gmail]/All Mail"', readonly=True)
-        status, data = imap.search(
-            None, "X-GM-RAW", f'"from:{SENDER} newer_than:2d"'
-        )
-        if status != "OK" or not data[0]:
-            return None
-        newest = data[0].split()[-1]
-        status, parts = imap.fetch(newest, "(RFC822)")
-        if status != "OK":
-            return None
-        return email.message_from_bytes(parts[0][1], policy=email.policy.default)
-    finally:
+class Mailbox:
+    """Read-only Gmail over IMAP. Message numbers are stable for the session."""
+
+    def __init__(self, address: str, app_password: str):
+        self.imap = imaplib.IMAP4_SSL("imap.gmail.com")
+        self.imap.login(address, app_password)
+        self.imap.select('"[Gmail]/All Mail"', readonly=True)
+
+    def close(self) -> None:
         try:
-            imap.logout()
+            self.imap.logout()
         except Exception:
             pass
+
+    def search(self, senders: tuple[str, ...], days: int = LOOKBACK_DAYS) -> list[bytes]:
+        """Emails from any of these senders in the last N days, oldest first."""
+        frm = senders[0] if len(senders) == 1 else f"({' OR '.join(senders)})"
+        status, data = self.imap.search(None, "X-GM-RAW", f'"from:{frm} newer_than:{days}d"')
+        return data[0].split() if status == "OK" and data[0] else []
+
+    def _fetch(self, num: bytes, what: str) -> email.message.EmailMessage:
+        status, parts = self.imap.fetch(num, what)
+        if status != "OK":
+            raise RuntimeError(f"IMAP fetch {what} failed for message {num!r}")
+        return email.message_from_bytes(parts[0][1], policy=email.policy.default)
+
+    def headers(self, num: bytes) -> email.message.EmailMessage:
+        return self._fetch(num, "(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE MESSAGE-ID)])")
+
+    def message(self, num: bytes) -> email.message.EmailMessage:
+        return self._fetch(num, "(RFC822)")
 
 
 # --------------------------------------------------------------- script ----
@@ -223,11 +298,11 @@ def _llm_openai(system: str, user: str) -> str:
     return resp.choices[0].message.content or ""
 
 
-def write_script(newsletter_text: str, when: datetime) -> str:
+def write_script(src: Source, newsletter_text: str, when: datetime) -> str:
     llm = _llm_gemini if SCRIPT_PROVIDER == "gemini" else _llm_openai
-    script = llm(SCRIPT_PROMPT.format(spoken_date=spoken_date(when)),
-                 newsletter_text[:MAX_EMAIL_CHARS]).strip()
-    if len(script.split()) < 200:
+    system = src.prompt.format(spoken_date=spoken_date(when), publication=src.publication)
+    script = llm(system, newsletter_text[:MAX_EMAIL_CHARS]).strip()
+    if len(script.split()) < src.min_words:
         raise RuntimeError(f"Script suspiciously short ({len(script.split())} words):\n{script}")
     if bad := unsupported_numbers(script, newsletter_text):
         print(f"WARNING: numbers in script not found in email: {bad}", file=sys.stderr)
@@ -372,8 +447,10 @@ def make_storage():
 
 # ----------------------------------------------------------------- feed ----
 
-def build_feed(episodes: list[Episode], base_url: str, token: str) -> str:
-    root = f"{base_url.strip().rstrip('/')}/{token.strip()}"
+def build_feed(episodes: list[Episode], base_url: str, prefix: str,
+               show: str = "Morning Brew, Read Aloud",
+               publication: str = "Morning Brew") -> str:
+    root = f"{base_url.strip().rstrip('/')}/{prefix.strip()}"
     items = []
     for ep in episodes:
         items.append(f"""\
@@ -389,11 +466,11 @@ def build_feed(episodes: list[Episode], base_url: str, token: str) -> str:
 <?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
   <channel>
-    <title>Morning Brew, Read Aloud</title>
+    <title>{escape(show)}</title>
     <link>{escape(root)}/feed.xml</link>
-    <description>A daily audio reading of the Morning Brew newsletter. Personal use.</description>
+    <description>An audio reading of the {escape(publication)} newsletter. Personal use.</description>
     <language>en-us</language>
-    <itunes:author>Morning Brew (narrated)</itunes:author>
+    <itunes:author>{escape(publication)} (narrated)</itunes:author>
     <itunes:block>Yes</itunes:block>
     <itunes:explicit>false</itunes:explicit>
 {chr(10).join(items)}
@@ -402,23 +479,27 @@ def build_feed(episodes: list[Episode], base_url: str, token: str) -> str:
 """
 
 
-def load_episodes(storage, token: str) -> list[Episode]:
-    raw = storage.get(f"{token}/episodes.json")
+def load_episodes(storage, prefix: str) -> list[Episode]:
+    raw = storage.get(f"{prefix}/episodes.json")
     return [Episode(**e) for e in json.loads(raw)] if raw else []
 
 
-def publish(storage, token: str, base_url: str, episode: Episode, audio: bytes,
-            episodes: list[Episode]) -> None:
-    storage.put(f"{token}/{episode.file}", audio, "audio/mpeg")
+def publish(storage, prefix: str, base_url: str, episode: Episode, audio: bytes,
+            episodes: list[Episode], show: str = "Morning Brew, Read Aloud",
+            publication: str = "Morning Brew") -> list[Episode]:
+    """Store the episode, rewrite the index and feed, and return the kept episodes."""
+    storage.put(f"{prefix}/{episode.file}", audio, "audio/mpeg")
     episodes = sorted([*episodes, episode], key=lambda e: e.date, reverse=True)
     for old in episodes[KEEP_EPISODES:]:
-        storage.delete(f"{token}/{old.file}")
+        storage.delete(f"{prefix}/{old.file}")
     episodes = episodes[:KEEP_EPISODES]
-    storage.put(f"{token}/episodes.json",
+    storage.put(f"{prefix}/episodes.json",
                 json.dumps([asdict(e) for e in episodes], indent=2).encode(),
                 "application/json")
-    storage.put(f"{token}/feed.xml", build_feed(episodes, base_url, token).encode(),
+    storage.put(f"{prefix}/feed.xml",
+                build_feed(episodes, base_url, prefix, show, publication).encode(),
                 "application/rss+xml")
+    return episodes
 
 
 # ------------------------------------------------------------------ cli ----
@@ -429,74 +510,145 @@ def require_env(*names: str) -> None:
         sys.exit(f"Missing environment variables: {', '.join(missing)}")
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--from-file", type=Path,
-                    help="use this text file instead of fetching from Gmail")
-    ap.add_argument("--script-only", action="store_true",
-                    help="print the spoken script and stop (no TTS, no publishing)")
-    ap.add_argument("--force", action="store_true",
-                    help="regenerate even if today's episode already exists")
-    args = ap.parse_args()
+def clean_subject(subject: object) -> str:
+    """Drop the leading emoji Morning Brew puts on every subject."""
+    return re.sub(r"^[^\w]+", "", str(subject or "")).strip()
 
-    tz = ZoneInfo(os.environ.get("BREW_TZ", "America/New_York"))
 
-    if args.from_file:
-        text = args.from_file.read_text()
-        when = datetime.now(tz)
-        subject = "Morning Brew"
-        msg_id = f"file-{hashlib.sha1(text.encode()).hexdigest()[:12]}"
-    else:
-        require_env("GMAIL_ADDRESS", "GMAIL_APP_PASSWORD")
-        msg = fetch_latest_brew(os.environ["GMAIL_ADDRESS"], os.environ["GMAIL_APP_PASSWORD"])
-        if msg is None:
-            sys.exit("No Morning Brew email from the last 2 days yet. Will retry on next run.")
-        text = message_body(msg)
-        when = email.utils.parsedate_to_datetime(msg["Date"]).astimezone(tz)
-        subject = re.sub(r"^[^\w]+", "", str(msg["Subject"] or "Morning Brew")).strip()
-        msg_id = hashlib.sha1(str(msg["Message-ID"]).encode()).hexdigest()[:16]
-
-    if not text:
-        sys.exit("Email had no readable body.")
-
-    require_env(*(["GEMINI_API_KEY"] if SCRIPT_PROVIDER == "gemini" else ["OPENAI_API_KEY"]))
-    if TTS_PROVIDER == "openai":
-        require_env("OPENAI_API_KEY")
-    if args.script_only:
-        print(write_script(text, when))
-        return
-
-    require_env("FEED_TOKEN", "PUBLIC_BASE_URL")
-    token = os.environ["FEED_TOKEN"].strip()
-    base_url = os.environ["PUBLIC_BASE_URL"].strip()  # pasted secrets often carry stray spaces
-    storage = make_storage()
-    episodes = load_episodes(storage, token)
-    if not args.force and any(e.id == msg_id for e in episodes):
-        # Cheap and self-healing: settings like the base URL apply without a new episode.
-        storage.put(f"{token}/feed.xml", build_feed(episodes, base_url, token).encode(),
-                    "application/rss+xml")
-        print("Already published today's episode; feed refreshed.")
-        return
-    episodes = [e for e in episodes if e.id != msg_id]
-
-    print("Writing script...", file=sys.stderr)
-    script = write_script(text, when)
-    print("Synthesizing audio...", file=sys.stderr)
+def make_episode(src: Source, storage, prefix: str, base_url: str,
+                 episodes: list[Episode], msg_id: str, when: datetime,
+                 subject: str, text: str) -> list[Episode]:
+    """Write the script, voice it, and publish. Returns the updated episode list."""
+    print(f"  [{src.key}] writing script...", file=sys.stderr)
+    script = write_script(src, text, when)
+    print(f"  [{src.key}] synthesizing audio...", file=sys.stderr)
     audio = synthesize(script)
 
     date = f"{when:%Y-%m-%d}"
     episode = Episode(
         id=msg_id,
         date=date,
-        title=f"{when:%b} {when.day}: {subject}",
-        file=f"episodes/{date}.mp3",
+        title=f"{when:%b} {when.day}: {subject or src.publication}",
+        file=f"episodes/{date}-{msg_id[:6]}.mp3",
         bytes=len(audio),
         summary=script.split("\n\n")[1][:300] if "\n\n" in script else script[:300],
         published=email.utils.format_datetime(when),
     )
-    publish(storage, token, base_url, episode, audio, episodes)
-    print(f"Published {episode.title} ({len(audio) / 1e6:.1f} MB)")
-    print(f"Feed: {base_url.rstrip('/')}/{token}/feed.xml")
+    episodes = [e for e in episodes if e.id != msg_id]
+    episodes = publish(storage, prefix, base_url, episode, audio, episodes,
+                       src.show, src.publication)
+    print(f"[{src.key}] published {episode.title} ({len(audio) / 1e6:.1f} MB)")
+    print(f"[{src.key}] feed: {base_url.rstrip('/')}/{prefix}/feed.xml")
+    return episodes
+
+
+def run_source(src: Source, box: Mailbox, storage, token: str, base_url: str,
+               tz: ZoneInfo, force: bool = False) -> int:
+    """Publish every email from this source that has no episode yet. Returns the count."""
+    prefix = "/".join(p for p in (token, src.subdir) if p)
+    episodes = load_episodes(storage, prefix)
+    first_run = not episodes
+    known_ids = {e.id for e in episodes}
+    # The same email can arrive twice (forwarded and direct); match on title too.
+    known_titles = {e.title for e in episodes}
+
+    matches = box.search(src.senders)
+    candidates = []  # oldest first
+    for num in matches:
+        hdr = box.headers(num)
+        subject = clean_subject(hdr["Subject"])
+        if re.search(src.skip_subject, subject, re.I):
+            print(f"[{src.key}] skipping non-edition email: {subject!r}")
+            continue
+        when = email.utils.parsedate_to_datetime(hdr["Date"]).astimezone(tz)
+        msg_id = hashlib.sha1(str(hdr["Message-ID"] or f"{subject}{hdr['Date']}").encode()
+                              ).hexdigest()[:16]
+        title = f"{when:%b} {when.day}: {subject or src.publication}"
+        candidates.append((num, msg_id, when, subject, title))
+
+    if force:
+        todo = candidates[-1:]  # regenerate the newest even though it exists
+    else:
+        todo = [c for c in candidates if c[1] not in known_ids and c[4] not in known_titles]
+        if first_run:
+            todo = todo[-1:]  # a new feed starts with the latest, not a backlog
+        todo = todo[-MAX_NEW_PER_RUN:]
+
+    newest = candidates[-1][4] if candidates else "none"
+    print(f"[{src.key}] {len(matches)} email(s) in the last {LOOKBACK_DAYS} days, "
+          f"{len(todo)} new; newest: {newest}")
+
+    published = 0
+    for num, msg_id, when, subject, _ in todo:
+        text = message_body(box.message(num))
+        if not text:
+            print(f"[{src.key}] email {subject!r} had no readable body; skipping")
+            continue
+        episodes = make_episode(src, storage, prefix, base_url, episodes, msg_id,
+                                when, subject, text)
+        published += 1
+
+    if not published and episodes:
+        # Cheap and self-healing: settings like the base URL apply without a new episode.
+        storage.put(f"{prefix}/feed.xml",
+                    build_feed(episodes, base_url, prefix, src.show, src.publication).encode(),
+                    "application/rss+xml")
+    return published
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--source", choices=["all", *SOURCES], default="all",
+                    help="which newsletter to process (default: all)")
+    ap.add_argument("--from-file", type=Path,
+                    help="use this text file instead of fetching from Gmail")
+    ap.add_argument("--script-only", action="store_true",
+                    help="print the spoken script and stop (no TTS, no publishing)")
+    ap.add_argument("--force", action="store_true",
+                    help="regenerate the newest episode even if it already exists")
+    args = ap.parse_args()
+
+    tz = ZoneInfo(os.environ.get("BREW_TZ", "America/New_York"))
+    sources = list(SOURCES.values()) if args.source == "all" else [SOURCES[args.source]]
+
+    require_env(*(["GEMINI_API_KEY"] if SCRIPT_PROVIDER == "gemini" else ["OPENAI_API_KEY"]))
+    if TTS_PROVIDER == "openai":
+        require_env("OPENAI_API_KEY")
+
+    if args.from_file:
+        src = sources[0] if len(sources) == 1 else SOURCES["brew"]
+        text = args.from_file.read_text()
+        when = datetime.now(tz)
+        if args.script_only:
+            print(write_script(src, text, when))
+            return
+        require_env("FEED_TOKEN", "PUBLIC_BASE_URL")
+        token = os.environ["FEED_TOKEN"].strip()
+        prefix = "/".join(p for p in (token, src.subdir) if p)
+        storage = make_storage()
+        msg_id = f"file-{hashlib.sha1(text.encode()).hexdigest()[:12]}"
+        make_episode(src, storage, prefix, os.environ["PUBLIC_BASE_URL"].strip(),
+                     load_episodes(storage, prefix), msg_id, when, src.publication, text)
+        return
+
+    require_env("GMAIL_ADDRESS", "GMAIL_APP_PASSWORD", "FEED_TOKEN", "PUBLIC_BASE_URL")
+    token = os.environ["FEED_TOKEN"].strip()
+    base_url = os.environ["PUBLIC_BASE_URL"].strip()  # pasted secrets often carry stray spaces
+    storage = make_storage()
+    box = Mailbox(os.environ["GMAIL_ADDRESS"], os.environ["GMAIL_APP_PASSWORD"])
+    failures = []
+    try:
+        for src in sources:
+            # One newsletter failing must not block the others.
+            try:
+                run_source(src, box, storage, token, base_url, tz, args.force)
+            except Exception as e:
+                print(f"[{src.key}] FAILED: {type(e).__name__}: {e}", file=sys.stderr)
+                failures.append(src.key)
+    finally:
+        box.close()
+    if failures:
+        sys.exit(f"Failed: {', '.join(failures)}")
 
 
 if __name__ == "__main__":

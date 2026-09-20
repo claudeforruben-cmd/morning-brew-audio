@@ -1,17 +1,29 @@
-name: Daily Morning Brew audio
+name: Newsletter podcasts
 
 on:
   schedule:
-    # Morning Brew lands ~09:20 UTC. Run at 10:15 and again at 11:15 as a
-    # retry; the second run is a no-op if the first succeeded.
-    - cron: "15 10 * * *"
-    - cron: "15 11 * * *"
+    # Every 30 minutes across the windows when newsletters arrive: Morning Brew
+    # and MarketWatch in the morning, WSJ Markets P.M. after the close. A run
+    # that finds nothing new takes seconds, and a late email (forwarding lag)
+    # is picked up by the next run. Off-peak minutes avoid GitHub's cron queue.
+    - cron: "17,47 9-14 * * *"
+    - cron: "17,47 20-23 * * *"
   workflow_dispatch:
     inputs:
+      source:
+        description: "Which newsletter"
+        type: choice
+        options: [all, brew, marketwatch, wsj]
+        default: all
       force:
-        description: "Regenerate even if today's episode exists"
+        description: "Regenerate the newest episode even if it exists"
         type: boolean
         default: false
+
+# Two runs must never publish at once (a manual run overlapping a scheduled one).
+concurrency:
+  group: newsletter-podcasts
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -24,7 +36,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - run: python brew.py ${{ inputs.force && '--force' || '' }}
+      - run: python brew.py --source ${{ inputs.source || 'all' }} ${{ inputs.force && '--force' || '' }}
         env:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
