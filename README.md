@@ -1,11 +1,20 @@
 # Newsletter Podcasts (Morning Brew, MarketWatch, WSJ)
 
-Whenever a newsletter email lands in Gmail, this has an LLM edit it into a
-listenable script (ads, footer, tables removed; wording kept), turns it into an
-MP3 with a free neural text-to-speech voice, and publishes it to a **private
-podcast feed**. There is one feed per newsletter. Subscribe once in Apple
-Podcasts on your iPhone; each episode shows up automatically, with lock-screen
-controls, speed control, and offline download.
+[![Newsletter podcasts](https://github.com/claudeforruben-cmd/morning-brew-audio/actions/workflows/daily.yml/badge.svg)](https://github.com/claudeforruben-cmd/morning-brew-audio/actions/workflows/daily.yml)
+![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)
+![Cost](https://img.shields.io/badge/cost-%240%20by%20default-brightgreen)
+![Last commit](https://img.shields.io/github/last-commit/claudeforruben-cmd/morning-brew-audio)
+
+On a schedule, this checks Gmail for new newsletter emails, has an LLM edit
+each one into a listenable script (ads, footer, tables removed; wording kept),
+turns it into an MP3 with a free neural text-to-speech voice, and publishes it
+to a **private podcast feed**. There is one feed per newsletter. Subscribe once
+in Apple Podcasts on your iPhone; each episode shows up automatically, with
+lock-screen controls, speed control, and offline download.
+
+<p align="center">
+  <img src="assets/pipeline.svg" width="820" alt="Pipeline: Gmail, script (Gemini), voice (Edge TTS), storage (S3), feed.xml, Podcasts app">
+</p>
 
 | Newsletter | `--source` | Feed URL |
 |---|---|---|
@@ -18,10 +27,31 @@ inbox adds hours of lag). Welcome and confirmation emails are skipped. To add a
 newsletter, add a `Source(...)` in `brew.py` and its name to the workflow's
 `source` options.
 
+<details>
+<summary><strong>How a run works</strong></summary>
+
+```mermaid
+flowchart LR
+    A["Gmail inbox<br/>IMAP search, last 2 days"] --> B{"New email with<br/>no episode yet?"}
+    B -->|no| Z["Refresh feed.xml only"]
+    B -->|"yes, up to 3"| C["Strip ads, footer, tables<br/>LLM edits into a spoken script"]
+    C --> D1["Gemini (free)"]
+    C --> D2["OpenAI (paid, optional)"]
+    D1 --> E1["Edge neural voice (free)"]
+    D2 --> E2["OpenAI TTS (paid, optional)"]
+    E1 --> F["MP3 audio"]
+    E2 --> F
+    F --> G["Upload to S3-compatible storage"]
+    G --> H["Rebuild feed.xml<br/>keep newest 14 episodes"]
+    H --> I(("Private podcast feed"))
+    I --> J["Apple Podcasts / Overcast"]
 ```
-Gmail (IMAP) -> script (Gemini, free) -> MP3 (Edge neural voice, free) -> S3 storage -> feed.xml -> Podcasts app
-                      runs daily on GitHub Actions (~9 min of audio, $0)
-```
+
+A run with nothing new finishes in seconds and, with the default free
+providers (Gemini + Edge TTS), costs $0. See [Schedule](#schedule) for when
+each newsletter's window runs.
+
+</details>
 
 ## One-time setup
 
