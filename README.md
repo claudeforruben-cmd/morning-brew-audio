@@ -8,19 +8,22 @@
 On a schedule, this checks Gmail for new newsletter emails, has an LLM edit
 each one into a listenable script (ads, footer, tables removed; wording kept),
 turns it into an MP3 with a free neural text-to-speech voice, and publishes it
-to a **private podcast feed**. There is one feed per newsletter. Subscribe once
-in Apple Podcasts on your iPhone; each episode shows up automatically, with
-lock-screen controls, speed control, and offline download.
+to a **private podcast feed**. All newsletters share one show, and each
+episode title starts with its newsletter (e.g. `WSJ · Sep 24: Yields Up, Stocks
+Flat`). Subscribe once in Apple Podcasts on your iPhone; each episode shows up
+automatically, with lock-screen controls, speed control, and offline download.
 
 <p align="center">
   <img src="assets/pipeline.svg" width="820" alt="Pipeline: Gmail, script (Gemini), voice (Edge TTS), storage (S3), feed.xml, Podcasts app">
 </p>
 
-| Newsletter | `--source` | Feed URL |
+Feed URL: `<PUBLIC_BASE_URL>/<FEED_TOKEN>/feed.xml`
+
+| Newsletter | `--source` | Title prefix |
 |---|---|---|
-| Morning Brew | `brew` | `<PUBLIC_BASE_URL>/<FEED_TOKEN>/feed.xml` |
-| MarketWatch | `marketwatch` | `<PUBLIC_BASE_URL>/<FEED_TOKEN>/marketwatch/feed.xml` |
-| Wall Street Journal | `wsj` | `<PUBLIC_BASE_URL>/<FEED_TOKEN>/wsj/feed.xml` |
+| Morning Brew | `brew` | `Morning Brew · ` |
+| MarketWatch Midday Report | `marketwatch` | `MarketWatch · ` |
+| WSJ Markets P.M. | `wsj` | `WSJ · ` |
 
 Subscribe the bot's Gmail directly to each newsletter (forwarding from another
 inbox adds hours of lag). Welcome and confirmation emails are skipped. To add a
@@ -42,7 +45,7 @@ flowchart LR
     E1 --> F["MP3 audio"]
     E2 --> F
     F --> G["Upload to S3-compatible storage"]
-    G --> H["Rebuild feed.xml<br/>keep newest 14 episodes"]
+    G --> H["Rebuild feed.xml<br/>keep newest 30 episodes"]
     H --> I(("Private podcast feed"))
     I --> J["Apple Podcasts / Overcast"]
 ```
@@ -100,8 +103,8 @@ Push this folder to a **private** GitHub repo, then add these under
 | `FEED_TOKEN` | from step 3 |
 
 Run **Actions -> Newsletter podcasts -> Run workflow** once to publish the
-first episodes. Feed URLs are the table at the top (GitHub masks the secret
-parts in logs).
+first episodes. The feed URL is at the top (GitHub masks the secret parts in
+logs).
 
 ### 5. iPhone
 In Apple Podcasts: **Search** tab, paste the feed URL into the search box, and
@@ -150,4 +153,5 @@ Paid, higher-quality option: set `SCRIPT_PROVIDER=openai` and/or
 - The free voice uses Microsoft Edge's online text-to-speech through the
   unofficial `edge-tts` library. It costs nothing but is not an official API and
   could break; if it does, switch `TTS_PROVIDER` to `openai`.
-- The last 14 episodes per feed are kept; older files are deleted from the bucket.
+- The last 30 episodes across all newsletters are kept; older files are deleted
+  from the bucket.

@@ -2,7 +2,8 @@
 """Turn newsletter emails (Morning Brew, MarketWatch, WSJ) into podcast episodes.
 
 Pipeline: Gmail (IMAP) -> plain text -> spoken script (LLM) -> MP3 (TTS)
--> object storage -> one private podcast RSS feed per newsletter.
+-> object storage -> one private podcast RSS feed, each episode titled with its
+newsletter.
 
 Idempotent: an email that already has an episode is never processed twice, and
 an email that arrives late is picked up on the next run.
@@ -25,7 +26,8 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo
 
-KEEP_EPISODES = 14
+KEEP_EPISODES = 30  # shared by all newsletters, so roughly two weeks
+SHOW = "Newsletters, Read Aloud"
 LOOKBACK_DAYS = 2  # how far back to look for emails that have no episode yet
 MAX_NEW_PER_RUN = 3  # newest N unpublished emails per source per run
 MAX_TTS_CHARS = 3800  # OpenAI speech endpoint rejects input over 4096 chars
@@ -139,26 +141,28 @@ End with: "That's your {publication} briefing."
 @dataclass(frozen=True)
 class Source:
     key: str  # --source name, GitHub Actions input
-    show: str  # podcast title
+    label: str  # episode title prefix
     publication: str  # spoken name
     senders: tuple[str, ...]  # Gmail from: matches (address or domain)
     prompt: str
-    subdir: str = ""  # feed folder under the token; "" keeps the original URL
     min_words: int = 120  # a script shorter than this means something went wrong
     # Welcome and confirmation emails are not editions.
     skip_subject: str = r"\b(welcome|confirm|verify|thanks for signing)\b"
 
 
 SOURCES = {s.key: s for s in (
-    Source("brew", "Morning Brew, Read Aloud", "Morning Brew",
+    Source("brew", "Morning Brew", "Morning Brew",
            ("crew@morningbrew.com",), BREW_PROMPT, min_words=200),
-    Source("marketwatch", "MarketWatch, Read Aloud", "MarketWatch",
+    Source("marketwatch", "MarketWatch", "MarketWatch",
            # The Midday Report comes from reports@marketwatchmail.com.
-           ("marketwatchmail.com", "marketwatch.com"), MARKETS_PROMPT,
-           subdir="marketwatch"),
-    Source("wsj", "Wall Street Journal, Read Aloud", "The Wall Street Journal",
-           ("wsj.com",), MARKETS_PROMPT, subdir="wsj"),
+           ("marketwatchmail.com", "marketwatch.com"), MARKETS_PROMPT),
+    Source("wsj", "WSJ", "The Wall Street Journal",
+           ("wsj.com",), MARKETS_PROMPT),
 )}
+
+
+def episode_title(src: Source, when: datetime, subject: str) -> str:
+    return f"{src.label} · {when:%b} {when.day}: {subject or src.publication}"
 
 
 @dataclass
@@ -449,10 +453,10 @@ def make_storage():
 
 # ----------------------------------------------------------------- feed ----
 
-def build_feed(episodes: list[Episode], base_url: str, prefix: str,
-               show: str = "Morning Brew, Read Aloud",
-               publication: str = "Morning Brew") -> str:
+def build_feed(episodes: list[Episode], base_url: str, prefix: str) -> str:
     root = f"{base_url.strip().rstrip('/')}/{prefix.strip()}"
+    names = [s.publication for s in SOURCES.values()]
+    publications = f"{', '.join(names[:-1])} and {names[-1]}"
     items = []
     for ep in episodes:
         items.append(f"""\
@@ -468,11 +472,11 @@ def build_feed(episodes: list[Episode], base_url: str, prefix: str,
 <?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
   <channel>
-    <title>{escape(show)}</title>
+    <title>{escape(SHOW)}</title>
     <link>{escape(root)}/feed.xml</link>
-    <description>An audio reading of the {escape(publication)} newsletter. Personal use.</description>
+    <description>Audio readings of the {escape(publications)} newsletters. Personal use.</description>
     <language>en-us</language>
-    <itunes:author>{escape(publication)} (narrated)</itunes:author>
+    <itunes:author>Newsletters (narrated)</itunes:author>
     <itunes:block>Yes</itunes:block>
     <itunes:explicit>false</itunes:explicit>
 {chr(10).join(items)}
@@ -483,15 +487,21 @@ def build_feed(episodes: list[Episode], base_url: str, prefix: str,
 
 def load_episodes(storage, prefix: str) -> list[Episode]:
     raw = storage.get(f"{prefix}/episodes.json")
-    return [Episode(**e) for e in json.loads(raw)] if raw else []
+    episodes = [Episode(**e) for e in json.loads(raw)] if raw else []
+    # Before the newsletters shared one feed, it held only untagged Morning Brew.
+    labels = tuple(f"{s.label} · " for s in SOURCES.values())
+    for e in episodes:
+        if not e.title.startswith(labels):
+            e.title = f"{SOURCES['brew'].label} · {e.title}"
+    return episodes
 
 
 def publish(storage, prefix: str, base_url: str, episode: Episode, audio: bytes,
-            episodes: list[Episode], show: str = "Morning Brew, Read Aloud",
-            publication: str = "Morning Brew") -> list[Episode]:
+            episodes: list[Episode]) -> list[Episode]:
     """Store the episode, rewrite the index and feed, and return the kept episodes."""
     storage.put(f"{prefix}/{episode.file}", audio, "audio/mpeg")
-    episodes = sorted([*episodes, episode], key=lambda e: e.date, reverse=True)
+    episodes = sorted([*episodes, episode], reverse=True,
+                      key=lambda e: (e.date, email.utils.parsedate_to_datetime(e.published)))
     for old in episodes[KEEP_EPISODES:]:
         storage.delete(f"{prefix}/{old.file}")
     episodes = episodes[:KEEP_EPISODES]
@@ -499,8 +509,7 @@ def publish(storage, prefix: str, base_url: str, episode: Episode, audio: bytes,
                 json.dumps([asdict(e) for e in episodes], indent=2).encode(),
                 "application/json")
     storage.put(f"{prefix}/feed.xml",
-                build_feed(episodes, base_url, prefix, show, publication).encode(),
-                "application/rss+xml")
+                build_feed(episodes, base_url, prefix).encode(), "application/rss+xml")
     return episodes
 
 
@@ -530,15 +539,14 @@ def make_episode(src: Source, storage, prefix: str, base_url: str,
     episode = Episode(
         id=msg_id,
         date=date,
-        title=f"{when:%b} {when.day}: {subject or src.publication}",
+        title=episode_title(src, when, subject),
         file=f"episodes/{date}-{msg_id[:6]}.mp3",
         bytes=len(audio),
         summary=script.split("\n\n")[1][:300] if "\n\n" in script else script[:300],
         published=email.utils.format_datetime(when),
     )
     episodes = [e for e in episodes if e.id != msg_id]
-    episodes = publish(storage, prefix, base_url, episode, audio, episodes,
-                       src.show, src.publication)
+    episodes = publish(storage, prefix, base_url, episode, audio, episodes)
     print(f"[{src.key}] published {episode.title} ({len(audio) / 1e6:.1f} MB)")
     print(f"[{src.key}] feed: {base_url.rstrip('/')}/{prefix}/feed.xml")
     return episodes
@@ -547,7 +555,7 @@ def make_episode(src: Source, storage, prefix: str, base_url: str,
 def run_source(src: Source, box: Mailbox, storage, token: str, base_url: str,
                tz: ZoneInfo, force: bool = False) -> int:
     """Publish every email from this source that has no episode yet. Returns the count."""
-    prefix = "/".join(p for p in (token, src.subdir) if p)
+    prefix = token
     episodes = load_episodes(storage, prefix)
     first_run = not episodes
     known_ids = {e.id for e in episodes}
@@ -565,7 +573,7 @@ def run_source(src: Source, box: Mailbox, storage, token: str, base_url: str,
         when = email.utils.parsedate_to_datetime(hdr["Date"]).astimezone(tz)
         msg_id = hashlib.sha1(str(hdr["Message-ID"] or f"{subject}{hdr['Date']}").encode()
                               ).hexdigest()[:16]
-        title = f"{when:%b} {when.day}: {subject or src.publication}"
+        title = episode_title(src, when, subject)
         candidates.append((num, msg_id, when, subject, title))
 
     if force:
@@ -593,8 +601,7 @@ def run_source(src: Source, box: Mailbox, storage, token: str, base_url: str,
     if not published and episodes:
         # Cheap and self-healing: settings like the base URL apply without a new episode.
         storage.put(f"{prefix}/feed.xml",
-                    build_feed(episodes, base_url, prefix, src.show, src.publication).encode(),
-                    "application/rss+xml")
+                    build_feed(episodes, base_url, prefix).encode(), "application/rss+xml")
     return published
 
 
@@ -626,7 +633,7 @@ def main() -> None:
             return
         require_env("FEED_TOKEN", "PUBLIC_BASE_URL")
         token = os.environ["FEED_TOKEN"].strip()
-        prefix = "/".join(p for p in (token, src.subdir) if p)
+        prefix = token
         storage = make_storage()
         msg_id = f"file-{hashlib.sha1(text.encode()).hexdigest()[:12]}"
         make_episode(src, storage, prefix, os.environ["PUBLIC_BASE_URL"].strip(),

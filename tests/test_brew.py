@@ -139,22 +139,18 @@ class Feed(unittest.TestCase):
             self.assertTrue((Path(d) / "tok/feed.xml").exists())
 
 
-    def test_feed_uses_show_name_and_prefix(self):
-        xml = brew.build_feed([episode(19)], "https://x", "tok/wsj", "WSJ Show", "The WSJ")
-        root = ET.fromstring(xml)
-        self.assertEqual(root.find("channel/title").text, "WSJ Show")
-        self.assertEqual(root.find("channel/link").text, "https://x/tok/wsj/feed.xml")
-        self.assertEqual(root.find("channel/item/enclosure").get("url"),
-                         "https://x/tok/wsj/episodes/2026-09-19.mp3")
+    def test_untagged_episodes_from_the_old_feed_are_labeled_morning_brew(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = brew.LocalStorage(Path(d))
+            brew.publish(storage, "tok", "https://x", episode(19), b"mp3", [])
+            titles = [e.title for e in brew.load_episodes(storage, "tok")]
+            self.assertEqual(titles, ["Morning Brew · Sep 19 & friends"])
 
 
 class Sources(unittest.TestCase):
-    def test_morning_brew_keeps_its_original_feed_location(self):
-        self.assertEqual(brew.SOURCES["brew"].subdir, "")
-
-    def test_each_source_has_its_own_feed_folder(self):
-        subdirs = [s.subdir for s in brew.SOURCES.values()]
-        self.assertEqual(len(set(subdirs)), len(subdirs))
+    def test_each_source_has_its_own_label(self):
+        labels = [s.label for s in brew.SOURCES.values()]
+        self.assertEqual(len(set(labels)), len(labels))
 
     def test_prompts_format_without_stray_braces(self):
         for src in brew.SOURCES.values():
@@ -206,7 +202,7 @@ class RunSource(unittest.TestCase):
             storage = brew.LocalStorage(Path(d))
             self.assertEqual(self.run_it("brew", [FRI, SAT], storage), 1)
             titles = [e.title for e in brew.load_episodes(storage, "tok")]
-            self.assertEqual(titles, ["Sep 19: Sat: Buffett goodbye"])
+            self.assertEqual(titles, ["Morning Brew · Sep 19: Sat: Buffett goodbye"])
 
     def test_late_email_is_caught_up_even_after_a_newer_one_published(self):
         with tempfile.TemporaryDirectory() as d:
@@ -233,18 +229,20 @@ class RunSource(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             storage = brew.LocalStorage(Path(d))
             self.assertEqual(self.run_it("wsj", [WELCOME], storage), 0)
-            self.assertEqual(brew.load_episodes(storage, "tok/wsj"), [])
+            self.assertEqual(brew.load_episodes(storage, "tok"), [])
 
-    def test_sources_publish_to_separate_feeds(self):
+    def test_all_sources_share_one_feed_with_labeled_titles(self):
         with tempfile.TemporaryDirectory() as d:
             storage = brew.LocalStorage(Path(d))
             self.run_it("brew", [SAT], storage)
             self.run_it("wsj", [WELCOME, ("Markets P.M.: Stocks slide",
                                           "Mon, 21 Sep 2026 21:00:00 +0000", "<m@x>")], storage)
-            self.assertTrue((Path(d) / "tok/feed.xml").exists())
-            self.assertTrue((Path(d) / "tok/wsj/feed.xml").exists())
-            self.assertEqual(len(brew.load_episodes(storage, "tok")), 1)
-            self.assertEqual(len(brew.load_episodes(storage, "tok/wsj")), 1)
+            titles = [e.title for e in brew.load_episodes(storage, "tok")]
+            self.assertEqual(titles, ["WSJ · Sep 21: Markets P.M.: Stocks slide",
+                                      "Morning Brew · Sep 19: Sat: Buffett goodbye"])
+            feed = ET.fromstring((Path(d) / "tok/feed.xml").read_text())
+            self.assertEqual(len(feed.findall("channel/item")), 2)
+            self.assertFalse((Path(d) / "tok/wsj").exists())
 
     def test_two_editions_on_the_same_day_get_distinct_files(self):
         with tempfile.TemporaryDirectory() as d:
@@ -253,7 +251,7 @@ class RunSource(unittest.TestCase):
             pm = ("Markets P.M.: Close", "Mon, 21 Sep 2026 21:00:00 +0000", "<pm@x>")
             self.run_it("wsj", [am], storage)
             self.run_it("wsj", [am, pm], storage)
-            files = {e.file for e in brew.load_episodes(storage, "tok/wsj")}
+            files = {e.file for e in brew.load_episodes(storage, "tok")}
             self.assertEqual(len(files), 2)
 
     def test_force_regenerates_the_newest_email(self):
