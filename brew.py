@@ -153,7 +153,9 @@ SOURCES = {s.key: s for s in (
     Source("brew", "Morning Brew, Read Aloud", "Morning Brew",
            ("crew@morningbrew.com",), BREW_PROMPT, min_words=200),
     Source("marketwatch", "MarketWatch, Read Aloud", "MarketWatch",
-           ("marketwatch.com",), MARKETS_PROMPT, subdir="marketwatch"),
+           # The Midday Report comes from reports@marketwatchmail.com.
+           ("marketwatchmail.com", "marketwatch.com"), MARKETS_PROMPT,
+           subdir="marketwatch"),
     Source("wsj", "Wall Street Journal, Read Aloud", "The Wall Street Journal",
            ("wsj.com",), MARKETS_PROMPT, subdir="wsj"),
 )}

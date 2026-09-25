@@ -111,11 +111,11 @@ Latest** so it is ready offline before you leave. Overcast and Pocket Casts
 also accept feed URLs.
 
 ## Schedule
-The workflow runs every 30 minutes from 09:17 to 14:47 UTC (Morning Brew,
-MarketWatch) and from 20:17 to 23:47 UTC (WSJ Markets P.M., sent after the
-close). Each run publishes any email from the last 2 days that has no episode
-yet, so a late or forwarded email is caught by the next run, and a run with
-nothing new finishes in seconds. It logs the newest email it saw for each
+The workflow runs every 30 minutes from 09:17 to 14:47 UTC (Morning Brew),
+16:17 to 17:47 UTC (MarketWatch Midday Report, sent around noon ET) and 20:17
+to 23:47 UTC (WSJ Markets P.M., sent after the close). Each run publishes any
+email from the last 2 days that has no episode yet, so a late or forwarded
+email is caught by the next run, and a run with nothing new finishes in seconds. It logs the newest email it saw for each
 source. A source that errors turns the run red without blocking the others.
 Edit the `cron` lines in `.github/workflows/daily.yml` to change the windows.
 GitHub pauses scheduled workflows after 60 days without repository activity;
