@@ -89,6 +89,32 @@ class GeminiFallback(unittest.TestCase):
                 brew._llm_gemini("s", "u")
         self.assertEqual(len(calls), 1)
 
+    def test_all_models_overloaded_waits_and_tries_the_list_again(self):
+        calls, waits = [], []
+
+        def fake(model, system, user):
+            calls.append(model)
+            if len(calls) <= len(brew.GEMINI_MODELS):
+                raise self.http_error(503)
+            return "the script"
+
+        with mock.patch.object(brew, "_gemini_call", fake), \
+                mock.patch.object(brew, "SCRIPT_MODEL", ""), \
+                mock.patch.object(brew.time, "sleep", waits.append):
+            self.assertEqual(brew._llm_gemini("s", "u"), "the script")
+        self.assertEqual(waits, [brew.GEMINI_RETRY_WAITS[0]])
+        self.assertEqual(len(calls), len(brew.GEMINI_MODELS) + 1)
+
+    def test_no_wait_when_no_model_was_merely_overloaded(self):
+        waits = []
+        with mock.patch.object(brew, "_gemini_call",
+                               lambda *a: (_ for _ in ()).throw(self.http_error(429))), \
+                mock.patch.object(brew, "SCRIPT_MODEL", ""), \
+                mock.patch.object(brew.time, "sleep", waits.append):
+            with self.assertRaises(RuntimeError):
+                brew._llm_gemini("s", "u")
+        self.assertEqual(waits, [])
+
     def test_all_models_failing_raises_readable_error(self):
         with mock.patch.object(brew, "_gemini_call",
                                lambda *a: (_ for _ in ()).throw(self.http_error(404))), \

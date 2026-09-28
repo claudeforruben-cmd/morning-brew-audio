@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -41,8 +42,11 @@ SCRIPT_MODEL = os.environ.get("SCRIPT_MODEL", "")  # empty = provider default
 # Gemini model names get retired and free-tier quota differs per model, so try
 # these in order until one answers. "gemini-flash-latest" is Google's alias.
 GEMINI_MODELS = ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.7-flash",
-                 "gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+                 "gemini-3.5-flash", "gemini-3.5-flash-lite"]
 GEMINI_SKIP_STATUSES = {404, 429, 500, 503}  # model missing, no quota, or overloaded
+# "High demand" 503s can hit every model at once for a few minutes, so after a
+# pass where all were overloaded, wait and go through the list again.
+GEMINI_RETRY_WAITS = (60, 120)
 TTS_MODEL = os.environ.get("TTS_MODEL", "gpt-4o-mini-tts")
 TTS_VOICE = os.environ.get("TTS_VOICE", "coral")  # OpenAI voice
 EDGE_VOICE = os.environ.get("EDGE_VOICE", "en-US-AndrewMultilingualNeural")
@@ -153,9 +157,10 @@ class Source:
 SOURCES = {s.key: s for s in (
     Source("brew", "Morning Brew", "Morning Brew",
            ("crew@morningbrew.com",), BREW_PROMPT, min_words=200),
+    # The Midday Report comes from reports@marketwatchmail.com. It is a handful
+    # of headlines, so a faithful script is often under 100 words.
     Source("marketwatch", "MarketWatch", "MarketWatch",
-           # The Midday Report comes from reports@marketwatchmail.com.
-           ("marketwatchmail.com", "marketwatch.com"), MARKETS_PROMPT),
+           ("marketwatchmail.com", "marketwatch.com"), MARKETS_PROMPT, min_words=50),
     Source("wsj", "WSJ", "The Wall Street Journal",
            ("wsj.com",), MARKETS_PROMPT),
 )}
@@ -275,21 +280,28 @@ def _gemini_call(model: str, system: str, user: str) -> str:
 def _llm_gemini(system: str, user: str) -> str:
     import urllib.error
 
-    failures = []
-    for model in [SCRIPT_MODEL] if SCRIPT_MODEL else GEMINI_MODELS:
-        try:
-            text = _gemini_call(model, system, user)
-        except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")[:400]
-            print(f"  gemini {model}: HTTP {e.code} {body}", file=sys.stderr)
-            failures.append(f"{model}: HTTP {e.code}")
-            if e.code not in GEMINI_SKIP_STATUSES:
-                raise  # bad key, bad request, etc.: another model won't help
-            continue
-        if text.strip():
-            print(f"  script written by {model}", file=sys.stderr)
-            return text
-        failures.append(f"{model}: empty response")
+    models = [SCRIPT_MODEL] if SCRIPT_MODEL else GEMINI_MODELS
+    for wait in (0, *GEMINI_RETRY_WAITS):
+        if wait:
+            print(f"  every model busy; retrying in {wait}s", file=sys.stderr)
+            time.sleep(wait)
+        failures = []
+        for model in models:
+            try:
+                text = _gemini_call(model, system, user)
+            except urllib.error.HTTPError as e:
+                body = e.read().decode(errors="replace")[:400]
+                print(f"  gemini {model}: HTTP {e.code} {body}", file=sys.stderr)
+                failures.append(f"{model}: HTTP {e.code}")
+                if e.code not in GEMINI_SKIP_STATUSES:
+                    raise  # bad key, bad request, etc.: another model won't help
+                continue
+            if text.strip():
+                print(f"  script written by {model}", file=sys.stderr)
+                return text
+            failures.append(f"{model}: empty response")
+        if not any("HTTP 503" in f for f in failures):
+            break  # missing models and spent quota won't recover in a minute
     raise RuntimeError("No Gemini model produced a script: " + "; ".join(failures))
 
 
